@@ -448,41 +448,56 @@ function supabaseHeaders(extra = {}){
   };
 }
 
+function cloneData(value){
+  return typeof structuredClone === "function"
+    ? structuredClone(value)
+    : JSON.parse(JSON.stringify(value));
+}
+
+async function fetchRemoteData(){
+  const endpoint =
+    `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?key=eq.${encodeURIComponent(STORAGE_KEY)}&select=value`;
+
+  const response = await fetch(endpoint, {
+    method: "GET",
+    headers: supabaseHeaders(),
+    cache: "no-store"
+  });
+
+  if(!response.ok){
+    throw new Error(`Falha ao carregar dados: ${response.status} ${await response.text()}`);
+  }
+
+  const rows = await response.json();
+  if(Array.isArray(rows) && rows.length && rows[0].value){
+    return typeof rows[0].value === "string"
+      ? JSON.parse(rows[0].value)
+      : rows[0].value;
+  }
+
+  return null;
+}
+
 async function loadData(){
   try{
-    const endpoint =
-      `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?key=eq.${encodeURIComponent(STORAGE_KEY)}&select=value`;
-
-    const response = await fetch(endpoint, {
-      method: "GET",
-      headers: supabaseHeaders(),
-      cache: "no-store"
-    });
-
-    if(!response.ok){
-      throw new Error(`Falha ao carregar dados: ${response.status} ${await response.text()}`);
-    }
-
-    const rows = await response.json();
-    if(Array.isArray(rows) && rows.length && rows[0].value){
-      DATA = typeof rows[0].value === "string"
-        ? JSON.parse(rows[0].value)
-        : rows[0].value;
+    const remote = await fetchRemoteData();
+    if(remote){
+      DATA = remote;
       return;
     }
 
-    DATA = structuredClone(SEED_DATA);
-    const initialized = await persist();
+    DATA = cloneData(SEED_DATA);
+    const initialized = await persist(DATA);
     if(!initialized){
       console.warn("O painel abriu com os dados iniciais, mas não conseguiu gravá-los no Supabase.");
     }
   }catch(e){
     console.error("Erro ao carregar dados do Supabase", e);
-    DATA = structuredClone(SEED_DATA);
+    DATA = cloneData(SEED_DATA);
   }
 }
 
-async function persist(){
+async function persist(snapshot = DATA){
   const endpoint = `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?on_conflict=key`;
 
   for(let attempt = 1; attempt <= 2; attempt++){
@@ -494,7 +509,7 @@ async function persist(){
         }),
         body: JSON.stringify({
           key: STORAGE_KEY,
-          value: DATA,
+          value: snapshot,
           updated_at: new Date().toISOString()
         })
       });
@@ -511,6 +526,24 @@ async function persist(){
   }
 
   return false;
+}
+
+/*
+  Aplica alterações sobre a versão mais recente do banco antes de salvar.
+  Isso reduz o risco de um check-in sobrescrever outro enviado quase ao mesmo tempo.
+*/
+async function mutateAndPersist(mutator){
+  try{
+    const latest = await fetchRemoteData();
+    const working = cloneData(latest || DATA || SEED_DATA);
+    await mutator(working);
+    const saved = await persist(working);
+    if(saved) DATA = working;
+    return saved;
+  }catch(e){
+    console.error("Erro ao atualizar dados compartilhados", e);
+    return false;
+  }
 }
 
 function allStudents(){
@@ -712,14 +745,24 @@ function openEditModal(id){
     const w1 = document.getElementById("ed-w1").value.trim();
     const n2 = document.getElementById("ed-n2").value.trim();
     const w2 = document.getElementById("ed-w2").value.trim();
-    const students = [];
-    if(n1) students.push({id: canga.students[0]?.id || (canga.id+"-a"), name:n1, whatsapp:w1});
-    if(n2) students.push({id: canga.students[1]?.id || (canga.id+"-b"), name:n2, whatsapp:w2});
-    canga.students = students;
-    const saved = await persist();
-    document.getElementById("modal").classList.remove("open");
-    renderGestaoGrid(); renderPainel();
-    if(!saved) showToast("Não deu pra salvar agora (instabilidade momentânea). Abre essa canga de novo em edição pra tentar salvar outra vez.", "warn");
+    const btn = document.getElementById("ed-save");
+    btn.disabled = true;
+    const saved = await mutateAndPersist(async (working) => {
+      const target = working.cangas.find(c => c.id === id);
+      if(!target) throw new Error("Canga não encontrada.");
+      const students = [];
+      if(n1) students.push({id: target.students[0]?.id || (target.id+"-a"), name:n1, whatsapp:w1});
+      if(n2) students.push({id: target.students[1]?.id || (target.id+"-b"), name:n2, whatsapp:w2});
+      target.students = students;
+    });
+    btn.disabled = false;
+    if(saved){
+      document.getElementById("modal").classList.remove("open");
+      renderGestaoGrid(); renderPainel();
+      showToast("Alterações salvas.");
+    } else {
+      showToast("Não deu pra salvar agora. Tente novamente em alguns segundos.", "warn");
+    }
   });
 }
 
@@ -758,12 +801,37 @@ document.addEventListener("DOMContentLoaded", async () => {
       const canga = DATA.cangas.find(c=>c.id===id);
       const ok = await showConfirm("Remover canga?", `Remover ${canga.label}? Isso apaga o histórico de check-ins dessa dupla.`);
       if(ok){
-        DATA.checkins = DATA.checkins.filter(ci => !canga.students.some(s=>s.id===ci.studentId));
-        DATA.cangas = DATA.cangas.filter(c=>c.id!==id);
-        const saved = await persist(); renderGestaoGrid(); renderPainel();
-        if(!saved) showToast("Não deu pra salvar a remoção agora (instabilidade momentânea). Tenta remover de novo em alguns segundos.", "warn");
-        else showToast(`${canga.label} removida.`);
+        btn.disabled = true;
+        const saved = await mutateAndPersist(async (working) => {
+          const target = working.cangas.find(c=>c.id===id);
+          if(!target) throw new Error("Canga não encontrada.");
+          const studentIds = new Set(target.students.map(s=>s.id));
+          working.checkins = working.checkins.filter(ci => !studentIds.has(ci.studentId));
+          working.cangas = working.cangas.filter(c=>c.id!==id);
+        });
+        btn.disabled = false;
+        if(!saved){
+          showToast("Não deu pra salvar a remoção agora. Tente novamente em alguns segundos.", "warn");
+        } else {
+          renderGestaoGrid(); renderPainel();
+          showToast(`${canga.label} removida.`);
+        }
       }
+    }
+  });
+
+  document.addEventListener("visibilitychange", async () => {
+    if(document.visibilityState !== "visible") return;
+    try{
+      const remote = await fetchRemoteData();
+      if(remote){
+        DATA = remote;
+        renderPainel();
+        populateStudentDatalist();
+        if(document.getElementById("view-gestao").classList.contains("active")) renderGestaoGrid();
+      }
+    }catch(e){
+      console.warn("Não foi possível atualizar os dados ao voltar para a página.", e);
     }
   });
 
@@ -809,8 +877,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     const hoursDone = parseFloat(document.getElementById("ci-hours-done").value) || 0;
     const hoursPlan = parseFloat(document.getElementById("ci-hours-plan").value) || 0;
     const workouts = parseInt(document.getElementById("ci-workouts").value) || 0;
-    DATA.checkins.push({
-      id: "chk" + Date.now(),
+    const submitBtn = document.getElementById("ci-submit");
+    const fb = document.getElementById("ci-feedback");
+    submitBtn.disabled = true;
+    fb.innerHTML = `<div class="warn-box">Salvando check-in...</div>`;
+
+    const checkin = {
+      id: "chk" + Date.now() + "-" + Math.random().toString(36).slice(2,8),
       studentId: student.id,
       studentName: student.name,
       cangaId: student.cangaId,
@@ -819,9 +892,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       date: new Date().toISOString(),
       hoursDone, hoursPlan, workouts,
       called: calledPartner === true
+    };
+
+    const saved = await mutateAndPersist(async (working) => {
+      if(!Array.isArray(working.checkins)) working.checkins = [];
+      working.checkins.push(checkin);
     });
-    const saved = await persist();
-    const fb = document.getElementById("ci-feedback");
+
+    submitBtn.disabled = false;
     if(saved){
       fb.innerHTML = `<div class="ok-box">Check-in salvo! Valeu, ${student.name}.</div>`;
       document.getElementById("ci-hours-done").value = "";
@@ -830,10 +908,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       calledPartner = null;
       document.getElementById("toggle-sim").classList.remove("selected");
       document.getElementById("toggle-nao").classList.remove("selected");
+      renderPainel();
       setTimeout(()=>{ fb.innerHTML=""; }, 3500);
     } else {
-      DATA.checkins.pop();
-      fb.innerHTML = `<div class="warn-box">Não deu pra salvar agora (instabilidade momentânea). Tenta de novo em alguns segundos, ${student.name}.</div>`;
+      fb.innerHTML = `<div class="warn-box">Não deu pra salvar agora. Tente novamente em alguns segundos, ${student.name}.</div>`;
     }
   });
 
@@ -855,22 +933,32 @@ document.addEventListener("DOMContentLoaded", async () => {
     const wa2 = document.getElementById("s2-wa").value.trim();
     const fb = document.getElementById("cad-feedback");
     if(!n1){ fb.innerHTML = `<div class="warn-box">Informe ao menos o nome do aluno 1.</div>`; return; }
-    const num = nextCangaNumber();
-    const newId = "c" + String(Date.now());
-    const students = [{id:newId+"-a", name:n1, whatsapp:wa1}];
-    if(n2) students.push({id:newId+"-b", name:n2, whatsapp:wa2});
-    DATA.cangas.push({ id:newId, label:"CANGA " + String(num).padStart(2,"0"), students });
-    const saved = await persist();
+    const submitBtn = document.getElementById("cad-submit");
+    submitBtn.disabled = true;
+    let createdLabel = "";
+    const saved = await mutateAndPersist(async (working) => {
+      let max = 0;
+      working.cangas.forEach(c => {
+        const m = c.label.match(/(\d+)/);
+        if(m) max = Math.max(max, parseInt(m[1],10));
+      });
+      const num = max + 1;
+      const newId = "c" + String(Date.now()) + Math.random().toString(36).slice(2,6);
+      const students = [{id:newId+"-a", name:n1, whatsapp:wa1}];
+      if(n2) students.push({id:newId+"-b", name:n2, whatsapp:wa2});
+      createdLabel = "CANGA " + String(num).padStart(2,"0");
+      working.cangas.push({ id:newId, label:createdLabel, students });
+    });
+    submitBtn.disabled = false;
     if(saved){
-      fb.innerHTML = `<div class="ok-box">CANGA ${String(num).padStart(2,"0")} cadastrada com sucesso.</div>`;
+      fb.innerHTML = `<div class="ok-box">${createdLabel} cadastrada com sucesso.</div>`;
       document.getElementById("s1-name").value=""; document.getElementById("s1-wa").value="";
       document.getElementById("s2-name").value=""; document.getElementById("s2-wa").value="";
       document.getElementById("dup-warning").innerHTML="";
       document.getElementById("next-number").textContent = "CANGA " + String(nextCangaNumber()).padStart(2,"0");
       renderPainel(); renderGestaoGrid();
     } else {
-      DATA.cangas.pop();
-      fb.innerHTML = `<div class="warn-box">Não deu pra salvar agora (instabilidade momentânea). Tenta de novo em alguns segundos.</div>`;
+      fb.innerHTML = `<div class="warn-box">Não deu pra salvar agora. Tente novamente em alguns segundos.</div>`;
     }
   });
 });
