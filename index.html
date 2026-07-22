@@ -435,24 +435,81 @@ function yokeSVG(){
     + '<circle cx="3" cy="17" r="2.6" fill="var(--red)"/><circle cx="31" cy="17" r="2.6" fill="var(--red)"/></svg>';
 }
 
+const SUPABASE_URL = "https://wfdnhjbuaqzmoikrtuut.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_bOXY5_8xLv56bo72N8Uneg_tCxdsxxQ";
+const SUPABASE_TABLE = "app_state";
+
+function supabaseHeaders(extra = {}){
+  return {
+    "apikey": SUPABASE_PUBLISHABLE_KEY,
+    "Authorization": "Bearer " + SUPABASE_PUBLISHABLE_KEY,
+    "Content-Type": "application/json",
+    ...extra
+  };
+}
+
 async function loadData(){
   try{
-    const res = await window.storage.get(STORAGE_KEY, true);
-    if(res && res.value){ DATA = JSON.parse(res.value); return; }
-  }catch(e){}
-  DATA = SEED_DATA;
-  persist(); // fire and forget: don't block page interactivity on the first save
+    const endpoint =
+      `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?key=eq.${encodeURIComponent(STORAGE_KEY)}&select=value`;
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: supabaseHeaders(),
+      cache: "no-store"
+    });
+
+    if(!response.ok){
+      throw new Error(`Falha ao carregar dados: ${response.status} ${await response.text()}`);
+    }
+
+    const rows = await response.json();
+    if(Array.isArray(rows) && rows.length && rows[0].value){
+      DATA = typeof rows[0].value === "string"
+        ? JSON.parse(rows[0].value)
+        : rows[0].value;
+      return;
+    }
+
+    DATA = structuredClone(SEED_DATA);
+    const initialized = await persist();
+    if(!initialized){
+      console.warn("O painel abriu com os dados iniciais, mas não conseguiu gravá-los no Supabase.");
+    }
+  }catch(e){
+    console.error("Erro ao carregar dados do Supabase", e);
+    DATA = structuredClone(SEED_DATA);
+  }
 }
+
 async function persist(){
+  const endpoint = `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?on_conflict=key`;
+
   for(let attempt = 1; attempt <= 2; attempt++){
     try{
-      await window.storage.set(STORAGE_KEY, JSON.stringify(DATA), true);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: supabaseHeaders({
+          "Prefer": "resolution=merge-duplicates,return=minimal"
+        }),
+        body: JSON.stringify({
+          key: STORAGE_KEY,
+          value: DATA,
+          updated_at: new Date().toISOString()
+        })
+      });
+
+      if(!response.ok){
+        throw new Error(`Falha ao salvar: ${response.status} ${await response.text()}`);
+      }
+
       return true;
     }catch(e){
-      console.error("Erro ao salvar (tentativa " + attempt + ")", e);
+      console.error("Erro ao salvar no Supabase (tentativa " + attempt + ")", e);
       if(attempt === 1) await new Promise(r => setTimeout(r, 800));
     }
   }
+
   return false;
 }
 
